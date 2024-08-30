@@ -1,5 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import './App.scss';
+import { ecgPeaks } from './utils/peaks';
+import { arrayAverage, arrayNormalize } from './utils/array';
 
 const WEBCAM_BLACKLIST = ['front', 'double', 'triple'];
 
@@ -22,8 +24,95 @@ function getAverageRed(ctx: CanvasRenderingContext2D) {
   return sumR / (data.width * data.height);
 }
 
+function getPresetCameraName() {
+  return 'Back Telephoto Camera';
+}
+
+async function requestPermission() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { exact: 'environment' },
+    },
+  });
+
+  return !!stream;
+}
+
+async function findCamera(onLog?: (log: string) => void) {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const presetCameraName = getPresetCameraName();
+  if (presetCameraName) {
+    const find = presetCameraName.toLowerCase();
+    for (const device of devices) {
+      if (device.label.toLowerCase() === find) {
+        onLog?.(`Using hardcoded camera label - ${device.label}`);
+        return device;
+      }
+    }
+  }
+
+  const canvas = document.createElement('canvas');
+  const video = document.createElement('video');
+  const ctx = canvas.getContext('2d')!;
+
+  canvas.width = 200;
+  canvas.height = 200;
+
+  let maxAvgR = 0;
+  let maxDevice: MediaDeviceInfo | undefined = undefined;
+
+  for (const device of devices) {
+    if (device.kind !== 'videoinput') {
+      continue;
+    }
+
+    onLog?.(`== Device ${device.label} ==`);
+
+    const label = device.label.toLowerCase();
+    let exit = false;
+    for (const word of WEBCAM_BLACKLIST) {
+      if (label.includes(word)) {
+        exit = true;
+        break;
+      }
+    }
+
+    if (exit) {
+      onLog?.(`Blacklisted`);
+      continue;
+    }
+
+    onLog?.(`Getting stream`);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: device.deviceId,
+        torch: true,
+      } as any,
+    });
+
+    video.srcObject = stream;
+    video.play();
+    await sleep(500);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const avgR = getAverageRed(ctx);
+    onLog?.(`Average red ${avgR}`);
+
+    if (avgR > maxAvgR) {
+      maxAvgR = avgR;
+      maxDevice = device;
+    }
+  }
+
+  if (maxAvgR < 128 || !maxDevice) {
+    return undefined;
+  }
+
+  return maxDevice;
+}
+
 function App() {
   const [log, setLog] = useState('');
+  const [bpm, setBPM] = useState(0);
   const chartRef = useRef<HTMLCanvasElement>(null);
 
   const appendLog = useCallback(
@@ -34,18 +123,11 @@ function App() {
   );
 
   const run = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { exact: 'environment' },
-      },
-    });
-
-    if (!stream) {
-      appendLog(`Can't find camera`);
+    if (!(await requestPermission())) {
+      appendLog(`Unable to obtain camera permission`);
       return;
     }
 
-    const devices = await navigator.mediaDevices.enumerateDevices();
     const canvas = document.createElement('canvas');
     const video = document.createElement('video');
     const ctx = canvas.getContext('2d')!;
@@ -54,63 +136,16 @@ function App() {
 
     canvas.width = 200;
     canvas.height = 200;
-    chartCtx.fillStyle = 'red';
 
-    let maxAvgR = 0;
-    let maxDevice: MediaDeviceInfo | undefined = undefined;
-
-    for (const device of devices) {
-      if (device.kind !== 'videoinput') {
-        continue;
-      }
-
-      appendLog(`== Device ${device.label} ==`);
-
-      const label = device.label.toLowerCase();
-      let exit = false;
-      for (const word of WEBCAM_BLACKLIST) {
-        if (label.includes(word)) {
-          exit = true;
-          break;
-        }
-      }
-
-      if (exit) {
-        appendLog(`Blacklisted`);
-        continue;
-      }
-
-      appendLog(`Getting stream`);
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          deviceId: device.deviceId,
-          torch: true,
-        } as any,
-      });
-
-      video.srcObject = stream;
-      video.play();
-      await sleep(500);
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const avgR = getAverageRed(ctx);
-      appendLog(`Average red ${avgR}`);
-
-      if (avgR > maxAvgR) {
-        maxAvgR = avgR;
-        maxDevice = device;
-      }
-    }
-
-    if (maxAvgR < 128 || !maxDevice) {
-      appendLog('Unable to find camera for heartrate measurement');
+    const device = await findCamera(appendLog);
+    if (!device) {
+      appendLog('Unable to find suitable camera');
       return;
     }
 
-    appendLog(`Found camera - ${maxDevice?.label}`);
-
     const finalStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        deviceId: maxDevice.deviceId,
+        deviceId: device.deviceId,
         torch: true,
       } as any,
     });
@@ -120,24 +155,54 @@ function App() {
     video.play();
     await sleep(1000);
 
-    let current = 0;
+    const SAMPLE_RATE = 60; // Hz
+    const WINDOW_SEC = 5; // seconds
+    const WINDOW_SIZE = WINDOW_SEC * SAMPLE_RATE; // Keep last x seconds.
+    const CHART_MIDDLE = Math.floor(chart.height / 2);
+
+    let samples: number[] = [];
     const onFrame = () => {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const avgR = getAverageRed(ctx);
 
-      chartCtx.clearRect(current, 0, 1, chart.height);
-      chartCtx.fillRect(current, 255 - avgR, 1, 1);
-      current++;
-      if (current >= chart.width) {
-        current = 0;
+      samples.push(255 - avgR);
+      if (samples.length > WINDOW_SIZE) {
+        samples = samples.slice(-WINDOW_SIZE);
       }
+
+      const normalized = arrayNormalize(samples);
+      chartCtx.clearRect(0, 0, chart.width, chart.height);
+      chartCtx.fillStyle = 'red';
+      chartCtx.fillRect(0, CHART_MIDDLE, chart.width, 1);
+
+      chartCtx.fillStyle = 'blue';
+      chartCtx.strokeStyle = 'blue';
+      chartCtx.beginPath();
+      chartCtx.moveTo(0, CHART_MIDDLE);
+      for (let i = 0; i < normalized.length; i++) {
+        chartCtx.lineTo(i, CHART_MIDDLE - normalized[i] * CHART_MIDDLE);
+      }
+      chartCtx.stroke();
+      chartCtx.closePath();
+
+      const peaks = ecgPeaks(normalized, SAMPLE_RATE);
+      chartCtx.fillStyle = 'yellow';
+      for (const peak of peaks) {
+        chartCtx.fillRect(peak, 0, 1, chart.height);
+      }
+      const timeBetweenPeaks = [];
+      for (let i = 0; i < peaks.length - 1; i++) {
+        timeBetweenPeaks.push(peaks[i + 1] - peaks[i]);
+      }
+      setBPM(60 / (arrayAverage(timeBetweenPeaks) / SAMPLE_RATE));
     };
 
-    setInterval(onFrame, 20);
-  }, [appendLog]);
+    setInterval(onFrame, 1000 / SAMPLE_RATE);
+  }, [appendLog, setBPM]);
 
   return (
     <div>
+      <span>BPM: {Math.round(bpm)}</span>
       <pre>{log}</pre>
       <canvas width={600} height={255} ref={chartRef} />
       <button onClick={run}>Get heartrate</button>
